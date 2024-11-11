@@ -10,9 +10,10 @@ from omegaconf import OmegaConf
 from hydra.utils import instantiate
 from hydra import initialize_config_dir, compose
 from hydra.core.global_hydra import GlobalHydra
+import time
 
 # URL for accessing the raw webcam feed from the local machine
-video_feed_url = "http://66.27.122.32:5050/video_feed?key=12903hjk1230"
+video_feed_url = "http://{my home IP address}:5050/video_feed?key=12903hjk1230"
 
 # Flask app to serve the processed video stream
 app = Flask(__name__)
@@ -27,10 +28,8 @@ if torch.cuda.get_device_properties(0).major >= 8:
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-
 sam2_checkpoint = "checkpoints/sam2_hiera_small.pt"
 model_cfg = "sam2_hiera_s.yaml"
-### Custom build camera predictor
 
 # Clear Hydra's global state if already initialized
 if GlobalHydra.instance().is_initialized():
@@ -68,13 +67,12 @@ def _load_checkpoint(model, ckpt_path):
         sd = torch.load(ckpt_path, map_location="cpu")["model"]
         missing_keys, unexpected_keys = model.load_state_dict(sd)
         if missing_keys:
-            logging.error(missing_keys)
-            raise RuntimeError()
+            logging.error(f"Missing keys: {missing_keys}")
+            raise RuntimeError("Missing keys while loading checkpoint.")
         if unexpected_keys:
-            logging.error(unexpected_keys)
-            raise RuntimeError()
-        logging.info("Loaded checkpoint sucessfully")
-
+            logging.error(f"Unexpected keys: {unexpected_keys}")
+            raise RuntimeError("Unexpected keys while loading checkpoint.")
+        logging.info("Loaded checkpoint successfully.")
 
 _load_checkpoint(model, sam2_checkpoint)
 
@@ -85,8 +83,6 @@ model.eval()  # Setting model to evaluation mode
 
 # The `model` variable is now ready and equivalent to `predictor` in the previous code
 predictor = model
-
-###
 
 # Function to capture and process the frames from the raw feed
 def process_frames():
@@ -99,17 +95,20 @@ def process_frames():
     if_init = False
     frame_count = 0
 
+    print("[INFO] Starting frame processing thread...")
     with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
         while True:
             ret, frame = cap.read()
             if not ret:
-                break
+                print("[WARNING] Frame capture failed, retrying...")
+                time.sleep(0.1)
+                continue
 
-            height, width = frame.shape[:2]
             frame_count += 1
 
             # Only perform initialization on the first frame
             if not if_init:
+                height, width = frame.shape[:2]
                 predictor.load_first_frame(frame)
                 if_init = True
                 obj_id = 1
@@ -130,21 +129,24 @@ def process_frames():
             if out_mask_logits.shape[0] > 0:
                 mask = (out_mask_logits[0, 0] > 0).cpu().numpy().astype("uint8") * 255
             else:
-                mask = np.zeros((height, width), dtype="uint8")
+                mask = np.zeros((frame.shape[0], frame.shape[1]), dtype="uint8")
 
-            # Invert and prepare the mask for overlay (not displayed)
+            # Invert and prepare the mask for overlay
             inverted_mask_colored = cv2.cvtColor(cv2.bitwise_not(mask), cv2.COLOR_GRAY2BGR)
             overlayed_frame = cv2.addWeighted(frame, 0.7, inverted_mask_colored, 0.3, 0)
 
-            # Update the processed frame for Flask
+            # Thread-safe update of the shared `processed_frame` variable
             with frame_lock:
                 processed_frame = overlayed_frame
 
+            # Small delay to control frame rate and avoid overwhelming system resources
+            time.sleep(0.03)
+
     cap.release()
+    print("[INFO] Frame processing ended.")
 
 # Start a background thread to process the frames continuously
-processing_thread = threading.Thread(target=process_frames)
-processing_thread.daemon = True
+processing_thread = threading.Thread(target=process_frames, daemon=True)
 processing_thread.start()
 
 # Flask endpoint to stream the processed video
@@ -154,12 +156,13 @@ def processed_feed():
         global processed_frame
         while True:
             with frame_lock:
-                if processed_frame is None:
-                    continue
-                _, buffer = cv2.imencode('.jpg', processed_frame)
-                frame = buffer.tobytes()
-                yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+                if processed_frame is not None:
+                    _, buffer = cv2.imencode('.jpg', processed_frame)
+                    frame = buffer.tobytes()
+                    yield (b'--frame\r\n'
+                           b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+            # Adding a small delay to prevent excessive CPU usage
+            time.sleep(0.03)
 
     response = Response(generate_processed_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
     response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"

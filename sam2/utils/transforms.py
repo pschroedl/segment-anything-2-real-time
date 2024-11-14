@@ -25,18 +25,11 @@ class SAM2Transforms(nn.Module):
         self.mean = [0.485, 0.456, 0.406]
         self.std = [0.229, 0.224, 0.225]
         self.to_tensor = ToTensor()
-        try:
-            self.transforms = torch.jit.script(
-                nn.Sequential(
-                    Resize((self.resolution, self.resolution)),
-                    Normalize(self.mean, self.std),
-                )
-                )
-        except Exception as e:
-            print(f"Failed to torch jit script transforms: {e}, falling back to normal transforms")
-            self.transforms = nn.Sequential(
+        self.transforms = torch.jit.script(
+            nn.Sequential(
                 Resize((self.resolution, self.resolution)),
                 Normalize(self.mean, self.std),
+            )
         )
 
     def __call__(self, x):
@@ -82,25 +75,25 @@ class SAM2Transforms(nn.Module):
         """
         Perform PostProcessing on output masks.
         """
-        #from ...sam2.utils.misc import get_connected_components
+        from sam2.utils.misc import get_connected_components
 
         masks = masks.float()
-        # if self.max_hole_area > 0:
-        #     # Holes are those connected components in background with area <= self.fill_hole_area
-        #     # (background regions are those with mask scores <= self.mask_threshold)
-        #     mask_flat = masks.flatten(0, 1).unsqueeze(1)  # flatten as 1-channel image
-        #     labels, areas = get_connected_components(mask_flat <= self.mask_threshold)
-        #     is_hole = (labels > 0) & (areas <= self.max_hole_area)
-        #     is_hole = is_hole.reshape_as(masks)
-        #     # We fill holes with a small positive mask score (10.0) to change them to foreground.
-        #     masks = torch.where(is_hole, self.mask_threshold + 10.0, masks)
+        if self.max_hole_area > 0:
+            # Holes are those connected components in background with area <= self.fill_hole_area
+            # (background regions are those with mask scores <= self.mask_threshold)
+            mask_flat = masks.flatten(0, 1).unsqueeze(1)  # flatten as 1-channel image
+            labels, areas = get_connected_components(mask_flat <= self.mask_threshold)
+            is_hole = (labels > 0) & (areas <= self.max_hole_area)
+            is_hole = is_hole.reshape_as(masks)
+            # We fill holes with a small positive mask score (10.0) to change them to foreground.
+            masks = torch.where(is_hole, self.mask_threshold + 10.0, masks)
 
-        # if self.max_sprinkle_area > 0:
-        #     labels, areas = get_connected_components(mask_flat > self.mask_threshold)
-        #     is_hole = (labels > 0) & (areas <= self.max_sprinkle_area)
-        #     is_hole = is_hole.reshape_as(masks)
-        #     # We fill holes with negative mask score (-10.0) to change them to background.
-        #     masks = torch.where(is_hole, self.mask_threshold - 10.0, masks)
+        if self.max_sprinkle_area > 0:
+            labels, areas = get_connected_components(mask_flat > self.mask_threshold)
+            is_hole = (labels > 0) & (areas <= self.max_sprinkle_area)
+            is_hole = is_hole.reshape_as(masks)
+            # We fill holes with negative mask score (-10.0) to change them to background.
+            masks = torch.where(is_hole, self.mask_threshold - 10.0, masks)
 
         masks = F.interpolate(masks, orig_hw, mode="bilinear", align_corners=False)
         return masks

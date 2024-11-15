@@ -21,17 +21,11 @@ class DownloadAndLoadSAM2Model:
     def INPUT_TYPES(s):
         return {"required": {
             "model": ([ 
-                    'sam2_hiera_base_plus.safetensors',
-                    'sam2_hiera_large.safetensors',
                     'sam2_hiera_small.safetensors',
                     'sam2_hiera_tiny.safetensors',
-                    'sam2.1_hiera_base_plus.safetensors',
-                    'sam2.1_hiera_large.safetensors',
-                    'sam2.1_hiera_small.safetensors',
-                    'sam2.1_hiera_tiny.safetensors',
                     ],),
             "segmentor": (
-                    ['single_image','video', 'automaskgenerator'],
+                    ['single_image','video', 'automaskgenerator', 'realtime'],
                     ),
             "device": (['cuda', 'cpu', 'mps'], ),
             "precision": ([ 'fp16','bf16','fp32'],
@@ -76,16 +70,8 @@ class DownloadAndLoadSAM2Model:
 
         model_mapping = {
             "2.0": {
-                "base": "sam2_hiera_b+.yaml",
-                "large": "sam2_hiera_l.yaml",
                 "small": "sam2_hiera_s.yaml",
                 "tiny": "sam2_hiera_t.yaml"
-            },
-            "2.1": {
-                "base": "sam2.1_hiera_b+.yaml",
-                "large": "sam2.1_hiera_l.yaml",
-                "small": "sam2.1_hiera_s.yaml",
-                "tiny": "sam2.1_hiera_t.yaml"
             }
         }
         version = "2.1" if "2.1" in model else "2.0"
@@ -747,14 +733,93 @@ class Sam2AutoSegmentation:
 
 
 #         return (mask_tensor,)
-     
+
+
+class Sam2CameraSegmentation:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "sam2_model": ("SAM2MODEL", ),
+                "keep_model_loaded": ("BOOLEAN", {"default": True}),
+            }
+        }
+
+    RETURN_NAMES = ("MASK",)
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "segment_images"
+    CATEGORY = "SAM2"
+
+    def segment_images(self, images, sam2_model, keep_model_loaded):
+        offload_device = mm.unet_offload_device()
+        model = sam2_model["model"]
+        device = sam2_model["device"]
+        dtype = sam2_model["dtype"]
+        segmentor = sam2_model["segmentor"]
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model.to(device)
+
+        frame_lock = threading.Lock()
+        processed_frames = []
+        
+        # The `model` variable is now ready and equivalent to `predictor` returned by sam2.build_sam.build_sam2_camera_predictor
+        predictor = model
+
+        def process_frame(frame, frame_idx):
+            with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+                frame = frame.permute(1, 2, 0).cpu().numpy()  # Convert back to HWC format for OpenCV
+                height, width = frame.shape[:2]
+
+                # Initialization on the first frame
+                if not self.if_init:
+                    self.predictor.load_first_frame(frame)
+                    self.if_init = True
+                    obj_id = 1
+
+                    # Define point prompt (e.g., background selection for demo purposes)
+                    point = [int(width * 2 / 3), int(height / 2)]
+                    points = [point]
+                    labels = [1]
+
+                    _, _, _ = self.predictor.add_new_prompt(frame_idx, obj_id, points=points, labels=labels)
+                else:
+                    # Track objects in subsequent frames
+                    _, out_mask_logits = self.predictor.track(frame)
+
+                # Process the output mask
+                if out_mask_logits.shape[0] > 0:
+                    mask = (out_mask_logits[0, 0] > 0).cpu().numpy().astype("uint8") * 255
+                else:
+                    mask = np.zeros((height, width), dtype="uint8")
+
+                # Prepare the overlay
+                inverted_mask_colored = cv2.cvtColor(cv2.bitwise_not(mask), cv2.COLOR_GRAY2BGR)
+                overlayed_frame = cv2.addWeighted(frame, 0.7, inverted_mask_colored, 0.3, 0)
+
+                # Thread-safe storage of processed frames
+                with frame_lock:
+                    processed_frames.append(torch.from_numpy(overlayed_frame).permute(2, 0, 1).float() / 255.0)
+
+        # Process all images as frames
+        pbar = ProgressBar(images.shape[0])
+        for frame_idx, frame in enumerate(images):
+            process_frame(frame, frame_idx)
+            pbar.update(1)
+
+        # Convert the list of processed frames to a tensor
+        output_frames = torch.stack(processed_frames)
+        return (output_frames,)
+
 NODE_CLASS_MAPPINGS = {
     "DownloadAndLoadSAM2Model": DownloadAndLoadSAM2Model,
     "Sam2Segmentation": Sam2Segmentation,
     "Florence2toCoordinates": Florence2toCoordinates,
     "Sam2AutoSegmentation": Sam2AutoSegmentation,
     "Sam2VideoSegmentationAddPoints": Sam2VideoSegmentationAddPoints,
-    "Sam2VideoSegmentation": Sam2VideoSegmentation
+    "Sam2VideoSegmentation": Sam2VideoSegmentation,
+    "Sam2CameraSegmentation": Sam2CameraSegmentation
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "DownloadAndLoadSAM2Model": "(Down)Load SAM2Model",
@@ -762,5 +827,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Florence2toCoordinates": "Florence2 Coordinates",
     "Sam2AutoSegmentation": "Sam2AutoSegmentation",
     "Sam2VideoSegmentationAddPoints": "Sam2VideoSegmentationAddPoints",
-    "Sam2VideoSegmentation": "Sam2VideoSegmentation"
+    "Sam2VideoSegmentation": "Sam2VideoSegmentation",
+    "Sam2CameraSegmentation": "Sam2CameraSegmentation"
 }

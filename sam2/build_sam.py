@@ -84,6 +84,12 @@ def build_sam2_camera_predictor(
     hydra_overrides_extra=[],
     apply_postprocessing=True,
 ):
+    if GlobalHydra.instance().is_initialized():
+    GlobalHydra.instance().clear()
+
+    # Initialize Hydra to load the configuration
+    config_path = "sam2_configs"
+
     hydra_overrides = [
         "++model._target_=sam2.sam2_camera_predictor.SAM2CameraPredictor",
     ]
